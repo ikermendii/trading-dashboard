@@ -87,11 +87,12 @@ export function PnLBar({ data, view, isDark }: Props) {
             border: `1px solid ${tooltipBorder}`,
             borderRadius: "8px",
             fontSize: 12,
-            color: isDark ? "#e4e4e7" : "#111827",
           }}
+          labelStyle={{ color: isDark ? "#a1a1aa" : "#6b7280" }}
+          itemStyle={{ color: isDark ? "#e4e4e7" : "#111827" }}
           labelFormatter={(ts) => tooltipLabel(ts, view)}
           formatter={(val) => [
-            `${Number(val) >= 0 ? "+" : ""}$${Math.abs(Number(val)).toFixed(0)}`,
+            `${Number(val) >= 0 ? "+" : "-"}$${Math.abs(Number(val)).toFixed(0)}`,
             "P&L",
           ]}
         />
