@@ -1,6 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 import { BOTS, alpacaFetch, BotId } from "@/lib/alpaca";
-import type { DashboardData, EquityPoint, TradeActivity } from "@/lib/types";
+import type {
+  DashboardData,
+  EquityPoint,
+  TradeActivity,
+  ClosedTrade,
+} from "@/lib/types";
 
 type Period = "1M" | "3M" | "6M" | "1Y" | "ALL";
 
@@ -41,6 +46,12 @@ export async function GET(req: NextRequest) {
     const dailyPnl = equity - lastEquity;
     const totalPnl = equity - bot.initialCapital;
 
+    // Apalancamiento global de la cuenta: exposición bruta / equity.
+    const longMv = parseFloat(account.long_market_value ?? "0") || 0;
+    const shortMv = Math.abs(parseFloat(account.short_market_value ?? "0")) || 0;
+    const grossExposure = equity > 0 ? (longMv + shortMv) / equity : 0;
+    const marginMultiplier = parseFloat(account.multiplier ?? "1") || 1;
+
     const equityHistory: EquityPoint[] = (historyRaw.timestamp ?? []).map(
       (ts: number, i: number) => ({
         timestamp: ts * 1000,
@@ -62,40 +73,120 @@ export async function GET(req: NextRequest) {
       costBasis: parseFloat(p.cost_basis),
     }));
 
-    // FIFO buy-sell matching for win/loss stats
+    // ── FIFO matching → operaciones cerradas (round-trips) ──────────────────
+    // Emparejamos entradas y salidas por símbolo en orden cronológico. Cada vez
+    // que una salida consume entradas, emitimos un ClosedTrade con P&L realizado,
+    // comisión y fechas. Soporta LONG (buy→sell) y SHORT (sell→buy).
     const fills = activitiesRaw
       .filter((a) => a.type === "fill" || a.type === "partial_fill")
       .sort((a, b) => a.transaction_time.localeCompare(b.transaction_time));
 
-    const buyQueues: Record<string, { price: number; qty: number }[]> = {};
-    let wins = 0, losses = 0, totalWin = 0, totalLoss = 0;
+    // Cola de aperturas abiertas por símbolo. side = dirección de la apertura.
+    type OpenLot = { price: number; qty: number; time: string; side: "long" | "short" };
+    const openLots: Record<string, OpenLot[]> = {};
+    const closedTrades: ClosedTrade[] = [];
+
+    const feeOf = (a: AlpacaActivity) =>
+      Math.abs(parseFloat(a.fee ?? a.commission ?? "0")) || 0;
 
     for (const f of fills) {
       const sym = f.symbol;
       const price = parseFloat(f.price);
       const qty = parseFloat(f.qty);
-      if (!buyQueues[sym]) buyQueues[sym] = [];
+      const fee = feeOf(f);
+      if (!openLots[sym]) openLots[sym] = [];
+      const lots = openLots[sym];
 
-      if (f.side === "buy") {
-        buyQueues[sym].push({ price, qty });
-      } else {
-        let remaining = qty;
-        while (remaining > 0 && buyQueues[sym].length > 0) {
-          const buy = buyQueues[sym][0];
-          const matched = Math.min(buy.qty, remaining);
-          const pl = (price - buy.price) * matched;
-          if (pl >= 0) { wins++; totalWin += pl; }
-          else { losses++; totalLoss += Math.abs(pl); }
-          buy.qty -= matched;
-          remaining -= matched;
-          if (buy.qty <= 0.0001) buyQueues[sym].shift();
-        }
+      // ¿Esta fill ABRE o CIERRA? Abre si no hay lotes opuestos que consumir.
+      const openSide: "long" | "short" = f.side === "buy" ? "long" : "short";
+      const opposite = lots.length > 0 && lots[0].side !== openSide;
+
+      if (!opposite) {
+        // Apertura (o ampliación) en la misma dirección.
+        lots.push({ price, qty, time: f.transaction_time, side: openSide });
+        continue;
+      }
+
+      // Cierre: consume lotes opuestos en FIFO.
+      let remaining = qty;
+      while (remaining > 0 && lots.length > 0 && lots[0].side !== openSide) {
+        const lot = lots[0];
+        const matched = Math.min(lot.qty, remaining);
+        // P&L: LONG = (salida-entrada); SHORT = (entrada-salida).
+        const entryPrice = lot.price;
+        const exitPrice = price;
+        const grossPl =
+          lot.side === "long"
+            ? (exitPrice - entryPrice) * matched
+            : (entryPrice - exitPrice) * matched;
+        // Prorratea la comisión de esta fill por la fracción consumida.
+        const tradeFee = fee * (matched / qty);
+        const netPl = grossPl - tradeFee;
+        const notional = entryPrice * matched;
+
+        closedTrades.push({
+          // groupKey: todas las piezas de la MISMA orden de salida comparten
+          // order_id → se consolidan en una fila. Fallback al id de la fill.
+          id: f.order_id ?? f.id,
+          symbol: sym,
+          side: lot.side,
+          qty: matched,
+          entryPrice,
+          exitPrice,
+          entryTime: lot.time,
+          exitTime: f.transaction_time,
+          realizedPl: netPl,
+          realizedPlPct: notional > 0 ? (netPl / notional) * 100 : 0,
+          commission: tradeFee,
+          notional,
+        });
+
+        lot.qty -= matched;
+        remaining -= matched;
+        if (lot.qty <= 0.0001) lots.shift();
+      }
+      // Si tras cerrar todo queda cantidad, abre en la nueva dirección (flip).
+      if (remaining > 0.0001) {
+        lots.push({ price, qty: remaining, time: f.transaction_time, side: openSide });
       }
     }
 
-    const closingFills = fills.filter((a) => a.side === "sell");
-    const winRate = wins + losses > 0 ? (wins / (wins + losses)) * 100 : 0;
-    const profitFactor = totalLoss > 0 ? totalWin / totalLoss : totalWin > 0 ? 999 : 0;
+    // Consolidar fragmentos del mismo round-trip. Una salida que se llena en
+    // varios lotes (o contra varias entradas del mismo precio/instante) genera
+    // múltiples ClosedTrade; los agrupamos por símbolo + entrada + salida en una
+    // sola fila legible. Así "un cierre = un trade" y las métricas no se inflan.
+    const mergedMap = new Map<string, ClosedTrade>();
+    for (const t of closedTrades) {
+      // Agrupa por orden de salida (t.id = order_id). Una orden de cierre llenada
+      // en varios lotes / contra varias entradas = una sola fila.
+      const key = t.id;
+      const ex = mergedMap.get(key);
+      if (!ex) {
+        mergedMap.set(key, { ...t });
+      } else {
+        // qty ponderada para recalcular precios medios y sumar P&L/comisión.
+        const totalQty = ex.qty + t.qty;
+        ex.entryPrice = (ex.entryPrice * ex.qty + t.entryPrice * t.qty) / totalQty;
+        ex.exitPrice = (ex.exitPrice * ex.qty + t.exitPrice * t.qty) / totalQty;
+        ex.qty = totalQty;
+        ex.realizedPl += t.realizedPl;
+        ex.commission += t.commission;
+        ex.notional += t.notional;
+        ex.realizedPlPct = ex.notional > 0 ? (ex.realizedPl / ex.notional) * 100 : 0;
+      }
+    }
+    const mergedTrades = Array.from(mergedMap.values()).sort((a, b) =>
+      b.exitTime.localeCompare(a.exitTime)
+    );
+
+    // Recalcular win/loss sobre trades consolidados (un cierre = un trade).
+    let mWins = 0, mLosses = 0, mTotalWin = 0, mTotalLoss = 0;
+    for (const t of mergedTrades) {
+      if (t.realizedPl >= 0) { mWins++; mTotalWin += t.realizedPl; }
+      else { mLosses++; mTotalLoss += Math.abs(t.realizedPl); }
+    }
+    const winRate = mWins + mLosses > 0 ? (mWins / (mWins + mLosses)) * 100 : 0;
+    const profitFactor = mTotalLoss > 0 ? mTotalWin / mTotalLoss : mTotalWin > 0 ? 999 : 0;
 
     const recentTrades: TradeActivity[] = activitiesRaw.slice(0, 50).map((a) => ({
       id: a.id,
@@ -117,15 +208,20 @@ export async function GET(req: NextRequest) {
         dailyPnlPct: lastEquity > 0 ? (dailyPnl / lastEquity) * 100 : 0,
         totalPnl,
         totalPnlPct: (totalPnl / bot.initialCapital) * 100,
+        grossExposure,
+        longMarketValue: longMv,
+        shortMarketValue: shortMv,
+        marginMultiplier,
       },
       positions,
       equityHistory: equityHistory.filter((p) => p.equity > 0),
       recentTrades,
+      closedTrades: mergedTrades,
       stats: {
-        totalTrades: closingFills.length,
+        totalTrades: mergedTrades.length,
         winRate,
-        avgWin: wins > 0 ? totalWin / wins : 0,
-        avgLoss: losses > 0 ? totalLoss / losses : 0,
+        avgWin: mWins > 0 ? mTotalWin / mWins : 0,
+        avgLoss: mLosses > 0 ? mTotalLoss / mLosses : 0,
         profitFactor,
         openPositions: positions.length,
         maxPositions: bot.maxPositions,
@@ -166,4 +262,9 @@ interface AlpacaActivity {
   price: string;
   transaction_time: string;
   type: string;
+  /** order_id agrupa todas las partial_fills de una misma orden. */
+  order_id?: string;
+  /** Alpaca paper trading no devuelve fees; presentes por compatibilidad live. */
+  fee?: string;
+  commission?: string;
 }

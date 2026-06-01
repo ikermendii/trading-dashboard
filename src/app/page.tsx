@@ -15,12 +15,13 @@ import {
   Sun,
   Moon,
   Download,
+  Layers,
 } from "lucide-react";
 import { format } from "date-fns";
 import { MetricCard } from "@/components/MetricCard";
 import { EquityCurve } from "@/components/EquityCurve";
 import { PositionsTable } from "@/components/PositionsTable";
-import { TradeHistory } from "@/components/TradeHistory";
+import { ClosedTrades } from "@/components/ClosedTrades";
 import { PnLBar, type PnlView } from "@/components/PnLBar";
 import type { DashboardData } from "@/lib/types";
 import type { BotId } from "@/lib/alpaca";
@@ -146,13 +147,15 @@ export default function Dashboard() {
   const exportTrades = () => {
     if (!data) return;
     exportCSV(
-      `trades_${botId}_${format(new Date(), "yyyy-MM-dd")}.csv`,
-      ["Date", "Symbol", "Side", "Qty", "Price", "Notional"],
-      data.recentTrades.map((t) => [
-        format(new Date(t.timestamp), "yyyy-MM-dd HH:mm"),
+      `closed_trades_${botId}_${format(new Date(), "yyyy-MM-dd")}.csv`,
+      ["Exit Date", "Entry Date", "Symbol", "Direction", "Qty", "Entry Price", "Exit Price", "Realized P&L $", "Realized P&L %", "Commission"],
+      data.closedTrades.map((t) => [
+        format(new Date(t.exitTime), "yyyy-MM-dd HH:mm"),
+        format(new Date(t.entryTime), "yyyy-MM-dd HH:mm"),
         t.symbol, t.side, String(t.qty),
-        Number(t.price).toFixed(2),
-        (Number(t.qty) * Number(t.price)).toFixed(2),
+        t.entryPrice.toFixed(4), t.exitPrice.toFixed(4),
+        t.realizedPl.toFixed(2), t.realizedPlPct.toFixed(2),
+        t.commission.toFixed(2),
       ])
     );
   };
@@ -294,7 +297,7 @@ export default function Dashboard() {
           </div>
 
           {/* Secondary stats */}
-          <div className="grid grid-cols-3 gap-3">
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
             <MetricCard
               label="Win Rate"
               value={stats ? `${stats.winRate.toFixed(1)}%` : "—"}
@@ -312,6 +315,19 @@ export default function Dashboard() {
               value={stats && stats.avgWin > 0 ? `$${fmt(stats.avgWin)}` : "—"}
               sub={stats && stats.avgLoss > 0 ? `Avg loss: $${fmt(stats.avgLoss)}` : undefined}
               positive={stats && stats.avgWin > 0 && stats.avgLoss > 0 ? stats.avgWin > stats.avgLoss : null}
+            />
+            <MetricCard
+              label="Apalancamiento"
+              value={acc ? `${acc.grossExposure.toFixed(2)}x` : "—"}
+              sub={
+                acc
+                  ? acc.marginMultiplier > 1
+                    ? `Margen ${acc.marginMultiplier}x · exp. $${fmt(acc.longMarketValue + acc.shortMarketValue)}`
+                    : "Sin apalancamiento"
+                  : undefined
+              }
+              positive={acc ? acc.grossExposure <= 1.0 : null}
+              icon={<Layers size={15} />}
             />
           </div>
 
@@ -386,7 +402,7 @@ export default function Dashboard() {
             <div className="flex items-center border-b border-gray-200 dark:border-zinc-800">
               {([
                 { id: "positions" as Tab, label: `Posiciones${stats ? ` (${stats.openPositions})` : ""}` },
-                { id: "trades" as Tab, label: "Historial" },
+                { id: "trades" as Tab, label: `Operaciones cerradas${data ? ` (${data.closedTrades.length})` : ""}` },
               ]).map(({ id, label }) => (
                 <button
                   key={id}
@@ -418,7 +434,10 @@ export default function Dashboard() {
               ) : tab === "positions" ? (
                 <PositionsTable positions={data?.positions ?? []} />
               ) : (
-                <TradeHistory trades={data?.recentTrades ?? []} />
+                <ClosedTrades
+                  trades={data?.closedTrades ?? []}
+                  marginMultiplier={acc?.marginMultiplier ?? 1}
+                />
               )}
             </div>
           </div>
