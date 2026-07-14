@@ -23,7 +23,8 @@ import { EquityCurve } from "@/components/EquityCurve";
 import { PositionsTable } from "@/components/PositionsTable";
 import { ClosedTrades } from "@/components/ClosedTrades";
 import { PnLBar, type PnlView } from "@/components/PnLBar";
-import type { DashboardData } from "@/lib/types";
+import { WeeklySummary } from "@/components/WeeklySummary";
+import type { DashboardData, SummaryResponse } from "@/lib/types";
 import type { BotId } from "@/lib/alpaca";
 
 type Period = "1M" | "3M" | "6M" | "1Y" | "ALL";
@@ -84,6 +85,7 @@ export default function Dashboard() {
   const [period, setPeriod] = useState<Period>("3M");
   const [pnlView, setPnlView] = useState<PnlView>("daily");
   const [isDark, setIsDark] = useState(true);
+  const [summary, setSummary] = useState<SummaryResponse | null>(null);
 
   const selectedBot = BOTS.find((b) => b.id === botId)!;
 
@@ -122,6 +124,18 @@ export default function Dashboard() {
     const iv = setInterval(() => load(botId), 60_000);
     return () => clearInterval(iv);
   }, [botId, load]);
+
+  // Resumen reconciliado (ambos bots) — la cifra fiable. Refresca cada 5 min.
+  useEffect(() => {
+    const loadSummary = () =>
+      fetch("/api/summary")
+        .then((r) => (r.ok ? r.json() : null))
+        .then((d) => d && setSummary(d))
+        .catch(() => {});
+    loadSummary();
+    const iv = setInterval(loadSummary, 300_000);
+    return () => clearInterval(iv);
+  }, []);
 
   const switchBot = (id: BotId) => {
     setBotId(id);
@@ -263,6 +277,9 @@ export default function Dashboard() {
               Error cargando datos: {error}
             </div>
           )}
+
+          {/* Resumen semanal reconciliado (ambos bots) — cifra fiable */}
+          <WeeklySummary data={summary} />
 
           {/* Metric cards */}
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">

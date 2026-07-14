@@ -83,3 +83,46 @@ export interface BotStats {
   openPositions: number;
   maxPositions: number;
 }
+
+/**
+ * Resumen reconciliado por aritmética de caja — la ÚNICA cifra fiable.
+ * El campo `equity` de Alpaca paper sufre saltos fantasma (oculta posiciones,
+ * cash erróneo); esto lo evita: reconciledEquity = funding + ventas − compras
+ * − fees + valor de posiciones abiertas. Ver alpaca-paper-phantom-equity-artifact.
+ */
+export interface BotSummary {
+  id: string;
+  name: string;
+  /** Capital inicial real (JNLC de financiación; fallback initialCapital). */
+  funding: number;
+  /** Equity real reconciliado (la cifra buena). */
+  reconciledEquity: number;
+  /** Equity que reporta Alpaca (puede glitchear). */
+  rawEquity: number;
+  cashLog: number;
+  positionsMv: number;
+  totalPnl: number;
+  totalPnlPct: number;
+  fees: number;
+  /** P&L por segmento (realizado + no realizado de posiciones abiertas). */
+  cryptoPnl: number;
+  stockPnl: number;
+  /** Realizado por dirección (FIFO sobre fills, símbolos normalizados). */
+  stockLong: number;
+  stockShort: number;
+  cryptoLong: number;
+  cryptoShort: number;
+  /** Realizado en ventanas recientes (progreso). */
+  realized7d: number;
+  realized30d: number;
+  openPositions: number;
+  /** Símbolos de posiciones abiertas SIN stop protector. */
+  unprotected: string[];
+  lastFillTime: string | null;
+  error?: string;
+}
+
+export interface SummaryResponse {
+  generatedAt: string;
+  bots: BotSummary[];
+}
