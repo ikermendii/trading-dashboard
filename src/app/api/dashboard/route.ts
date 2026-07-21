@@ -61,6 +61,27 @@ export async function GET(req: NextRequest) {
       })
     );
 
+    // portfolio/history con timeframe 1D trae como último punto el cierre ANTERIOR
+    // y no refleja el intradía: la curva se queda plana aunque la cuenta se haya
+    // movido hoy (visto en Hybrid: history $93.466 vs cuenta real $101.954, +$8.5k
+    // que no aparecían). Empalmamos el equity EN VIVO como punto final para que el
+    // gráfico refleje la realidad. Si el último punto ya es de hoy, se sustituye;
+    // si no, se añade uno nuevo "ahora".
+    const nowMs = Date.now();
+    const utcDay = (ms: number) => new Date(ms).toISOString().slice(0, 10);
+    const livePoint: EquityPoint = {
+      timestamp: nowMs,
+      equity,
+      pnl: dailyPnl,
+      pnlPct: lastEquity > 0 ? (dailyPnl / lastEquity) * 100 : 0,
+    };
+    const lastPt = equityHistory[equityHistory.length - 1];
+    if (lastPt && utcDay(lastPt.timestamp) === utcDay(nowMs)) {
+      equityHistory[equityHistory.length - 1] = livePoint;
+    } else {
+      equityHistory.push(livePoint);
+    }
+
     const positions = positionsRaw.map((p) => ({
       symbol: p.symbol,
       side: p.side as "long" | "short",
