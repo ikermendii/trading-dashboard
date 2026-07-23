@@ -42,7 +42,11 @@ export async function GET(req: NextRequest) {
       ]);
 
     const equity = parseFloat(account.equity);
-    const lastEquity = parseFloat(account.last_equity);
+    // Alpaca a veces devuelve last_equity=0 (cuenta paper en fin de semana / reset).
+    // Sin guardar, dailyPnl = equity - 0 = equity → P&L diario falso (+$99k, +∞%).
+    // Si no es válido usamos equity como base → P&L diario 0 en vez de un valor absurdo.
+    const rawLastEquity = parseFloat(account.last_equity);
+    const lastEquity = rawLastEquity > 0 ? rawLastEquity : equity;
     const dailyPnl = equity - lastEquity;
     const totalPnl = equity - bot.initialCapital;
 
